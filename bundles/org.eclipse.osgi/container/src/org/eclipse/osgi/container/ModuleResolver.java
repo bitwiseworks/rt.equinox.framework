@@ -12,9 +12,11 @@ package org.eclipse.osgi.container;
 
 import java.security.Permission;
 import java.util.*;
+import java.util.concurrent.*;
 import org.apache.felix.resolver.*;
 import org.eclipse.osgi.container.ModuleRequirement.DynamicModuleRequirement;
 import org.eclipse.osgi.container.namespaces.EquinoxFragmentNamespace;
+import org.eclipse.osgi.internal.container.AtomicLazyInitializer;
 import org.eclipse.osgi.internal.container.InternalUtils;
 import org.eclipse.osgi.internal.debug.Debug;
 import org.eclipse.osgi.internal.framework.EquinoxConfiguration;
@@ -39,6 +41,7 @@ import org.osgi.service.resolver.*;
 final class ModuleResolver {
 	static final String SEPARATOR = System.getProperty("line.separator"); //$NON-NLS-1$
 	static final char TAB = '\t';
+	private static final int DEFAULT_BATCH_SIZE = Integer.MAX_VALUE;
 
 	private static final String OPTION_RESOLVER = EquinoxContainer.NAME + "/resolver"; //$NON-NLS-1$
 	private static final String OPTION_ROOTS = OPTION_RESOLVER + "/roots"; //$NON-NLS-1$
@@ -55,7 +58,6 @@ final class ModuleResolver {
 	boolean DEBUG_WIRING = false;
 	boolean DEBUG_REPORT = false;
 
-	private final int DEFAULT_BATCH_SIZE = 1;
 	final int resolverRevisionBatchSize;
 
 	void setDebugOptions() {
@@ -77,15 +79,52 @@ final class ModuleResolver {
 
 	final ThreadLocal<Boolean> threadResolving = new ThreadLocal<Boolean>();
 	final ModuleContainerAdaptor adaptor;
+	final AtomicLazyInitializer<ExecutorService> executor = new AtomicLazyInitializer<ExecutorService>();
+	final Callable<ExecutorService> lazyExecutorCreator;
+
+	{
+		lazyExecutorCreator = new Callable<ExecutorService>() {
+			@Override
+			public ExecutorService call() throws Exception {
+				// Always want to go to zero threads when idle
+				int coreThreads = 0;
+				// use the number of processors - 1 because we use the current thread when rejected
+				int maxThreads = Math.max(Runtime.getRuntime().availableProcessors() - 1, 1);
+				// idle timeout; make it short to get rid of threads quickly after resolve
+				int idleTimeout = 5;
+				// use sync queue to force thread creation
+				BlockingQueue<Runnable> queue = new SynchronousQueue<Runnable>();
+				// try to name the threads with useful name
+				ThreadFactory threadFactory = new ThreadFactory() {
+					@Override
+					public Thread newThread(Runnable r) {
+						Thread t = new Thread(r, "Resolver thread - " + adaptor.toString()); //$NON-NLS-1$
+						t.setDaemon(true);
+						return t;
+					}
+				};
+				// use a rejection policy that simply runs the task in the current thread once the max threads is reached
+				RejectedExecutionHandler rejectHandler = new RejectedExecutionHandler() {
+					@Override
+					public void rejectedExecution(Runnable r, ThreadPoolExecutor exe) {
+						r.run();
+					}
+				};
+				return new ThreadPoolExecutor(coreThreads, maxThreads, idleTimeout, TimeUnit.SECONDS, queue, threadFactory, rejectHandler);
+			}
+		};
+	}
 
 	/**
 	 * Constructs the module resolver with the specified resolver hook factory
 	 * and resolver.
 	 * @param adaptor the container adaptor
 	 */
-	ModuleResolver(ModuleContainerAdaptor adaptor) {
+	ModuleResolver(final ModuleContainerAdaptor adaptor) {
 		this.adaptor = adaptor;
+
 		setDebugOptions();
+
 		String batchSizeConfig = this.adaptor.getProperty(EquinoxConfiguration.PROP_RESOLVER_REVISION_BATCH_SIZE);
 		int tempBatchSize;
 		try {
@@ -470,11 +509,11 @@ final class ModuleResolver {
 			}
 
 			@Override
-			public void logUsesConstraintViolation(Resource resource, ResolutionException error) {
+			public void logUsesConstraintViolation(Resource resource, ResolutionError error) {
 				if (errors == null) {
 					errors = new HashMap<Resource, ResolutionException>();
 				}
-				errors.put(resource, error);
+				errors.put(resource, error.toException());
 				if (DEBUG_USES) {
 					Debug.println(new StringBuilder("RESOLVER: Uses constraint violation") //$NON-NLS-1$
 							.append(SEPARATOR).append(TAB) //
@@ -986,7 +1025,7 @@ final class ModuleResolver {
 			Map<Resource, List<Wire>> interimResults = null;
 			try {
 				transitivelyResolveFailures.addAll(revisions);
-				interimResults = new ResolverImpl(logger).resolve(this);
+				interimResults = new ResolverImpl(logger, executor.getInitialized(lazyExecutorCreator)).resolve(this);
 				applyInterimResultToWiringCopy(interimResults);
 				if (DEBUG_ROOTS) {
 					Debug.println("Resolver: resolved " + interimResults.size() + " bundles."); //$NON-NLS-1$ //$NON-NLS-2$
@@ -1181,7 +1220,7 @@ final class ModuleResolver {
 
 		private Map<Resource, List<Wire>> resolveDynamic() throws ResolutionException {
 			List<Capability> dynamicMatches = findProviders0(dynamicReq.getOriginal(), dynamicReq);
-			return new ResolverImpl(new Logger(0)).resolve(this, dynamicReq.getRevision(), dynamicReq.getOriginal(), dynamicMatches);
+			return new ResolverImpl(new Logger(0), null).resolve(this, dynamicReq.getRevision(), dynamicReq.getOriginal(), dynamicMatches);
 		}
 
 		private void filterResolvable() {
@@ -1415,5 +1454,12 @@ final class ModuleResolver {
 			return false;
 		}
 		return resolvingValue.booleanValue();
+	}
+
+	void shutdownExecutor() {
+		ExecutorService current = executor.getAndClear();
+		if (current != null) {
+			current.shutdown();
+		}
 	}
 }
